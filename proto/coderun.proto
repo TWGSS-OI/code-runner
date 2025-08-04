@@ -6,6 +6,8 @@ service CodeRunner {
 }
 
 message CommandRequest {
+    string id = 1;
+
     oneof command {
         PutFileRequest put = 2;
         RunCodeRequest run = 3;
@@ -14,6 +16,8 @@ message CommandRequest {
 }
 
 message CommandResponse {
+    string id = 1; 
+
     oneof response {
         PutFileResponse put = 2;
         RunCodeResponse run = 3;

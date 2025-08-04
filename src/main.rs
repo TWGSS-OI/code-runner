@@ -1,5 +1,8 @@
 mod runner;
 mod types;
+pub mod coderun {
+    tonic::include_proto!("coderun"); // The string specified here must match the proto package name
+}
 
 use coderun::code_runner_server::CodeRunner;
 use tokio::sync::mpsc;
@@ -7,9 +10,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::Streaming;
 use tonic::{Request, Response, Status, transport::Server};
-pub mod coderun {
-    tonic::include_proto!("coderun"); // The string specified here must match the proto package name
-}
 
 use crate::coderun::code_runner_server::CodeRunnerServer;
 use crate::coderun::command_request::Command;
@@ -80,6 +80,7 @@ impl CodeRunner for MyCodeRunner {
                             })
                             .expect("CommandRequest must contain a command");
                         // coderun::command_request::Command
+                        let req_id = v.id;
                         match command {
                             Command::Put(put) => {
                                 let file_path = put.filename;
@@ -96,6 +97,7 @@ impl CodeRunner for MyCodeRunner {
                                 }
 
                                 tx.send(Ok(CommandResponse {
+                                    id: req_id,
                                     response: Some(command_response::Response::Put(
                                         PutFileResponse {
                                             length: content.len() as u32,
@@ -129,6 +131,7 @@ impl CodeRunner for MyCodeRunner {
                                 );
 
                                 tx.send(Ok(CommandResponse {
+                                    id: req_id,
                                     response: Some(command_response::Response::Run(
                                         RunCodeResponse {
                                             stdout: output.stdout,
@@ -165,6 +168,7 @@ impl CodeRunner for MyCodeRunner {
                                 match runner.get_file(file_path) {
                                     Ok(content) => {
                                         tx.send(Ok(CommandResponse {
+                                            id: req_id,
                                             response: Some(command_response::Response::Get(
                                                 GetFileResponse {
                                                     content: content.clone(),
