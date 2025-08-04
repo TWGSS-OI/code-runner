@@ -1,157 +1,221 @@
+mod runner;
+mod types;
+
 use coderun::code_runner_server::CodeRunner;
-use coderun::{RunCodeRequest, RunCodeResponse, RunStatus};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt};
+use tonic::Streaming;
 use tonic::{Request, Response, Status, transport::Server};
 pub mod coderun {
     tonic::include_proto!("coderun"); // The string specified here must match the proto package name
 }
 
-use libc::{RLIMIT_AS, RLIMIT_CPU, rlimit, setrlimit};
-use std::{
-    io::{Read, Write},
-    os::unix::process::{CommandExt, ExitStatusExt},
-    process::{Command, Stdio},
-    time::Instant,
-};
-
-use wait4::Wait4;
-
 use crate::coderun::code_runner_server::CodeRunnerServer;
+use crate::coderun::command_request::Command;
+use crate::coderun::{
+    CommandRequest, CommandResponse, GetFileResponse, PutFileResponse, RunCodeResponse, RunStatus,
+    command_response,
+};
+use crate::runner::Runner;
+use crate::types::Limit;
+use std::error::Error;
+use std::io::ErrorKind;
+use std::pin::Pin;
 
 const CODE_DIR: &str = "/var/tmp/code-runner";
+
+type CommandResult<T> = Result<Response<T>, Status>;
+type ResponseStream = Pin<Box<dyn Stream<Item = Result<CommandResponse, Status>> + Send>>;
+
+fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
+    let mut err: &(dyn Error + 'static) = err_status;
+
+    loop {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            return Some(io_err);
+        }
+
+        // h2::Error do not expose std::io::Error with `source()`
+        // https://github.com/hyperium/h2/pull/462
+        if let Some(h2_err) = err.downcast_ref::<h2::Error>() {
+            if let Some(io_err) = h2_err.get_io() {
+                return Some(io_err);
+            }
+        }
+
+        err = err.source()?;
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct MyCodeRunner {}
 
 #[tonic::async_trait]
 impl CodeRunner for MyCodeRunner {
-    async fn run_code(
+    type StartSessionStream = ResponseStream;
+
+    async fn start_session(
         &self,
-        request: Request<RunCodeRequest>,
-    ) -> Result<Response<RunCodeResponse>, Status> {
-        let req = request.into_inner();
+        req: Request<Streaming<CommandRequest>>,
+    ) -> CommandResult<Self::StartSessionStream> {
+        let mut in_stream = req.into_inner();
+        let (tx, rx) = mpsc::channel(128);
 
-        let code_dir = format!(
-            "{}/{}",
-            CODE_DIR,
-            req.session.unwrap_or_else(|| (0..20)
+        println!("session started");
+
+        tokio::spawn(async move {
+            let session_id = (0..20)
                 .map(|_| fastrand::alphanumeric())
-                .collect::<String>())
-        );
-        std::fs::create_dir_all(&code_dir).expect("Failed to create code directory");
+                .collect::<String>();
+            let mut runner = Runner::new(format!("{}/{}", CODE_DIR, session_id));
 
-        for file in req.files {
-            let file_path = format!("{}/{}", code_dir, file.name);
-            std::fs::write(file_path, file.content).expect("Failed to write file");
-        }
+            while let Some(result) = in_stream.next().await {
+                match result {
+                    Ok(v) => {
+                        let command = v
+                            .command
+                            .ok_or_else(|| {
+                                Status::invalid_argument("CommandRequest must contain a command")
+                            })
+                            .expect("CommandRequest must contain a command");
+                        // coderun::command_request::Command
+                        match command {
+                            Command::Put(put) => {
+                                let file_path = put.filename;
+                                let content = put.content;
 
-        let mut command = Command::new(req.program);
+                                if let Err(err) = runner.put_file(file_path, &content) {
+                                    tx.send(Err(Status::internal(format!(
+                                        "Failed to put file: {}",
+                                        err
+                                    ))))
+                                    .await
+                                    .unwrap();
+                                    continue;
+                                }
 
-        command.current_dir(&code_dir);
+                                tx.send(Ok(CommandResponse {
+                                    response: Some(command_response::Response::Put(
+                                        PutFileResponse {
+                                            length: content.len() as u32,
+                                        },
+                                    )),
+                                    ..Default::default()
+                                }))
+                                .await
+                                .unwrap();
+                            }
+                            Command::Run(run) => {
+                                let run_command = run.command;
+                                let limits = run.limits;
+                                let stdin = run.input;
 
-        command.args(req.args);
+                                let limit = if let Some(limits) = limits {
+                                    Some(Limit {
+                                        memory: Some(limits.max_memory),
+                                        time_limit: Some(limits.max_runtime),
+                                        walltime_limit: Some(limits.max_runtime * 2),
+                                    })
+                                } else {
+                                    None
+                                };
 
-        command.stdin(Stdio::piped());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
+                                let output = runner.execute_program(
+                                    "/usr/bin/sh",
+                                    vec!["-c".to_string(), run_command],
+                                    limit,
+                                    stdin,
+                                );
 
-        if let Some(limits) = req.limits {
-            unsafe {
-                command.pre_exec(move || {
-                    let limit = rlimit {
-                        rlim_cur: 1024 * 1024 * limits.max_memory,
-                        rlim_max: 1024 * 1024 * limits.max_memory,
-                    };
-                    let cpu_limit = rlimit {
-                        rlim_cur: limits.max_runtime,
-                        rlim_max: limits.max_runtime,
-                    };
+                                tx.send(Ok(CommandResponse {
+                                    response: Some(command_response::Response::Run(
+                                        RunCodeResponse {
+                                            stdout: output.stdout,
+                                            stderr: output.stderr,
+                                            status: match output.status {
+                                                types::RunStatus::Success => {
+                                                    RunStatus::Success.into()
+                                                }
+                                                types::RunStatus::TimeLimitExceeded => {
+                                                    RunStatus::TimeLimitExceeded.into()
+                                                }
 
-                    if setrlimit(RLIMIT_AS, &limit) != 0 {
-                        eprintln!("warning: failed to set memory limit");
+                                                types::RunStatus::SystemError(_) => {
+                                                    RunStatus::SystemError.into()
+                                                }
+
+                                                types::RunStatus::RuntimeError(_) => {
+                                                    RunStatus::RuntimeError.into()
+                                                }
+                                            },
+                                            runtime: output.runtime as u64,
+                                            memory: output.memory_usage as u64,
+                                            exit_code: output.exit_code,
+                                        },
+                                    )),
+                                    ..Default::default()
+                                }))
+                                .await
+                                .unwrap();
+                            }
+                            Command::Get(get) => {
+                                let file_path = get.filename;
+
+                                match runner.get_file(file_path) {
+                                    Ok(content) => {
+                                        tx.send(Ok(CommandResponse {
+                                            response: Some(command_response::Response::Get(
+                                                GetFileResponse {
+                                                    content: content.clone(),
+                                                },
+                                            )),
+                                            ..Default::default()
+                                        }))
+                                        .await
+                                        .unwrap();
+                                    }
+                                    Err(err) => {
+                                        tx.send(Err(Status::internal(format!(
+                                            "Failed to get file: {}",
+                                            err
+                                        ))))
+                                        .await
+                                        .unwrap();
+                                    }
+                                }
+                            }
+                        }
                     }
+                    Err(err) => {
+                        if let Some(io_err) = match_for_io_error(&err) {
+                            if io_err.kind() == ErrorKind::BrokenPipe {
+                                eprintln!("\tclient disconnected: broken pipe");
+                                break;
+                            }
+                        }
 
-                    if setrlimit(RLIMIT_CPU, &cpu_limit) != 0 {
-                        eprintln!("warning: failed to set CPU time limit");
+                        match tx.send(Err(err)).await {
+                            Ok(_) => (),
+                            Err(_err) => break, // response was dropped
+                        }
                     }
-
-                    Ok(())
-                });
-            }
-        }
-
-        let start = Instant::now();
-
-        let resources_result = match command.spawn() {
-            Ok(mut child) => {
-                if let Some(input_data) = req.input {
-                    let mut stdin = child.stdin.take().expect("failed to open stdin");
-                    if let Err(_) = stdin.write_all(&input_data) {
-                        eprintln!("warning: failed to write to stdin, process could be dead");
-                    }
-                    drop(stdin);
                 }
-
-                Ok((
-                    child.wait4(),
-                    child.stdout.take().expect("expected stdout to be piped"),
-                    child.stderr.take().expect("expected stderr to be piped"),
-                ))
             }
-            Err(e) => Err(e),
-        };
 
-        let elapsed = start.elapsed();
-
-        if req.cleanup.unwrap_or_else(|| true) {
-            if let Err(e) = std::fs::remove_dir_all(&code_dir) {
-                eprintln!("warning: failed to clean up code directory: {}", e);
+            // clean up remove the session directory
+            if let Err(err) = runner.cleanup() {
+                eprintln!("Failed to clean up session directory: {}", err);
             }
-        }
 
-        match resources_result {
-            Ok(resources) => {
-                let (res_use, stdout, stderr) = resources;
+            print!("session {} ended\n", session_id);
+        });
 
-                let res_use = match res_use {
-                    Ok(r) => r,
-                    Err(e) => {
-                        // return Err(e);
-                        eprintln!("warning: failed to wait for child process: {}", e);
-                        return Err(Status::from_error(Box::new(e)));
-                    }
-                };
+        let out_stream = ReceiverStream::new(rx);
 
-                let output = stdout
-                    .bytes()
-                    .map(|b| b.expect("failed to read stdout"))
-                    .collect::<Vec<u8>>();
-
-                let error_output = stderr
-                    .bytes()
-                    .map(|b| b.expect("failed to read stderr"))
-                    .collect::<Vec<u8>>();
-
-                Ok(Response::new(RunCodeResponse {
-                    stdout: output,
-                    stderr: error_output,
-                    status: if res_use.status.success() {
-                        RunStatus::Success.into()
-                    } else if res_use.status.signal() == Some(9) {
-                        RunStatus::TimeLimitExceeded.into()
-                    } else {
-                        RunStatus::RuntimeError.into()
-                    },
-                    runtime: res_use.rusage.utime.as_millis() as u64
-                        + res_use.rusage.stime.as_millis() as u64,
-                    walltime: elapsed.as_millis() as u64,
-                    memory: res_use.rusage.maxrss,
-                }))
-            }
-            Err(e) => {
-                eprintln!("error: failed to run command: {}", e);
-                Err(Status::from_error(Box::new(e)))
-            }
-        }
+        Ok(Response::new(
+            Box::pin(out_stream) as Self::StartSessionStream
+        ))
     }
 }
 

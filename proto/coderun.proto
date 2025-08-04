@@ -1,72 +1,31 @@
 syntax = "proto3";
 package coderun;
 
-/*
-enum RunStatus {
-    Success,
-    TimeLimitExceeded,
-    RuntimeError,
-}
-
-struct RunResult {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    status: RunStatus,
-    runtime: std::time::Duration,
-    walltime: std::time::Duration,
-    memory: u64,
-}
-
-struct RunLimit {
-    max_runtime: std::time::Duration,
-    max_memory: u64,
-}
-
-struct File {
-    name: String,
-    content: Vec<u8>,
-}
-
-const CODE_DIR: &str = "/var/tmp/code-runner";
-
-fn run_code(
-    program: &str,
-    args: Vec<String>,
-    input: Option<Vec<u8>>,
-    limits: Option<RunLimit>,
-    files: Option<Vec<File>>,
-    session: Option<String>,
-    cleanup: Option<bool>,
-) -> Result<RunResult, io::Error> {
-*/
-
 service CodeRunner {
-    rpc RunCode(RunCodeRequest) returns (RunCodeResponse);
+    rpc StartSession(stream CommandRequest) returns (stream CommandResponse);
 }
 
-message RunCodeRequest {
-    string program = 1;
-    repeated string args = 2;
-    optional bytes input = 3;
-    optional RunLimit limits = 4;
-    repeated File files = 5;
-    optional string session = 6;
-    optional bool cleanup = 7;
+message CommandRequest {
+    oneof command {
+        PutFileRequest put = 2;
+        RunCodeRequest run = 3;
+        GetFileRequest get = 4;
+    }
 }
 
-message RunCodeResponse {
-    bytes stdout = 1;
-    bytes stderr = 2;
-    RunStatus status = 3;
-    uint64 runtime = 4; // in milliseconds
-    uint64 walltime = 5; // in milliseconds
-    uint64 memory = 6; // in bytes
+message CommandResponse {
+    oneof response {
+        PutFileResponse put = 2;
+        RunCodeResponse run = 3;
+        GetFileResponse get = 4;
+    }
 }
 
 enum RunStatus {
     SUCCESS = 0;
     TIME_LIMIT_EXCEEDED = 1;
     RUNTIME_ERROR = 2;
+    SYSTEM_ERROR = 3;
 }
 
 message RunLimit {
@@ -74,8 +33,35 @@ message RunLimit {
     uint64 max_memory = 2; // in bytes
 }
 
-message File {
-    string name = 1;
+message PutFileRequest {
+    string filename = 1;
     bytes content = 2;
 }
 
+message GetFileRequest {
+    string filename = 1;
+}
+
+
+message RunCodeRequest {
+    string command = 1;
+    optional bytes input = 2;
+    optional RunLimit limits = 3;
+}
+
+message PutFileResponse {
+    uint32 length = 1; // length of the file content
+}
+
+message GetFileResponse {
+    bytes content = 1;
+}
+
+message RunCodeResponse {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    RunStatus status = 3;
+    uint64 runtime = 4;
+    uint64 memory = 5;
+    optional int32 exit_code = 6;
+}
